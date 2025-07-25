@@ -1,0 +1,46 @@
+#!/bin/bash
+
+echo "==== NetScaler 초기화 및 클린업 스크립트 ===="
+
+# 1. NetScaler 설정 초기화 (clear config full)
+echo "> clear config full"
+echo "y" | /netscaler/cli/scripts/nscli -U : -i clear config full
+
+# 2. 삭제 대상 파일 목록
+FILES=(
+    "/nsconfig/rc.*"
+    "/nsconfig/ns.conf*"
+    "/nsconfig/ZebOS.conf*"
+    "/nsconfig/ntp.conf"
+)
+
+DIRS=(
+    "/nsconfig/ssl/*"
+    "/var/nslog/*"
+    "/var/crash/*"
+    "/var/nstrace/*"
+    "/var/log/*"
+    "/var/ns_sys_backup/*"
+    "/var/nsinstall/*"
+)
+
+# 2-1. 파일 삭제
+echo "== 파일 삭제 =="
+for f in "${FILES[@]}"
+do
+    rm -f $f 2>/dev/null
+done
+
+# 2-2. 폴더/디렉토리 내 파일 삭제
+echo "== 폴더 내 파일 삭제 =="
+for d in "${DIRS[@]}"
+do
+    rm -rf $d 2>/dev/null
+done
+
+echo "== 삭제 완료 =="
+
+# 3. 재부팅
+echo "5초 후 재부팅됩니다. (Ctrl+C로 중단 가능)"
+sleep 5
+reboot
