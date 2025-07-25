@@ -1,0 +1,212 @@
+@echo off
+setlocal enabledelayedexpansion
+
+
+if not defined HANDLER_SET (
+    set HANDLER_SET=1
+    goto MAIN
+)
+
+:MAIN
+
+echo ================================================================================
+echo                    Google DNS Monitor (8.8.8.8)
+echo ================================================================================
+
+set TARGET=8.8.8.8
+set PING_COUNT=4
+
+
+set /p TOTAL_MINUTES=How many minutes? (default 60): 
+if "%TOTAL_MINUTES%"=="" set TOTAL_MINUTES=60
+
+set /p CHECK_INTERVAL=Check every X seconds? (default 5): 
+if "%CHECK_INTERVAL%"=="" set CHECK_INTERVAL=5
+
+set /a TOTAL_CHECKS=%TOTAL_MINUTES%*60/%CHECK_INTERVAL%
+
+echo.
+echo Starting %TOTAL_MINUTES% minute monitoring every %CHECK_INTERVAL% seconds
+echo Total checks: %TOTAL_CHECKS%
+echo.
+
+
+set REPORT=google_dns_report.txt
+
+echo Google DNS Monitor Report > "%REPORT%"
+echo Start: %date% %time% >> "%REPORT%"
+echo Target: %TARGET% >> "%REPORT%"
+echo ======================================== >> "%REPORT%"
+
+
+set CHECK_COUNT=0
+set TOTAL_LOSS=0
+set SUCCESS_COUNT=0
+set WARNING_COUNT=0
+set FAIL_COUNT=0
+set ZERO_LOSS_COUNT=0
+
+
+:LOOP
+set /a CHECK_COUNT+=1
+
+
+set NOW=%time:~0,8%
+
+echo [%CHECK_COUNT%] %NOW% - Pinging %TARGET%...
+
+
+ping %TARGET% -n %PING_COUNT% > temp.txt
+
+
+findstr "TTL=" temp.txt >nul
+if errorlevel 1 (
+    echo     FAILED - No response
+    set LOSS=100
+    set AVG=N/A
+    set STATUS=FAIL
+    set /a FAIL_COUNT+=1
+) else (
+    
+    findstr "0%% loss" temp.txt >nul
+    if not errorlevel 1 (
+        set LOSS=0
+        set STATUS=OK
+        set /a SUCCESS_COUNT+=1
+        set /a ZERO_LOSS_COUNT+=1
+    ) else (
+        
+        findstr "25%% loss" temp.txt >nul && set LOSS=25
+        findstr "50%% loss" temp.txt >nul && set LOSS=50
+        findstr "75%% loss" temp.txt >nul && set LOSS=75
+        findstr "100%% loss" temp.txt >nul && set LOSS=100
+        
+        if !LOSS! EQU 100 (
+            set STATUS=FAIL
+            set /a FAIL_COUNT+=1
+        ) else (
+            set STATUS=WARNING
+            set /a WARNING_COUNT+=1
+        )
+    )
+    
+    
+    for /f "tokens=*" %%i in ('findstr "Average" temp.txt') do (
+        set line=%%i
+        for /f "tokens=2 delims==" %%j in ("!line!") do (
+            for /f "tokens=1 delims=m" %%k in ("%%j") do (
+                set AVG=%%k
+            )
+        )
+    )
+    if "!AVG!"=="" set AVG=N/A
+    
+    echo     !STATUS! - Loss: !LOSS!%%, Avg: !AVG!ms
+)
+
+
+echo [%CHECK_COUNT%] %NOW% - Loss: !LOSS!%%, Avg: !AVG!ms, Status: !STATUS! >> "%REPORT%"
+
+set /a TOTAL_LOSS+=!LOSS!
+
+
+if exist temp.txt del temp.txt
+
+
+call :UPDATE_STATS
+
+
+if %CHECK_COUNT% LSS %TOTAL_CHECKS% (
+    echo Waiting %CHECK_INTERVAL% seconds...
+    timeout /t %CHECK_INTERVAL% /nobreak >nul
+    goto LOOP
+)
+
+
+
+set /a AVG_LOSS=%TOTAL_LOSS%/%CHECK_COUNT%
+set /a SUCCESS_RATE=%SUCCESS_COUNT%*100/%CHECK_COUNT%
+set /a WARNING_RATE=%WARNING_COUNT%*100/%CHECK_COUNT%
+set /a FAIL_RATE=%FAIL_COUNT%*100/%CHECK_COUNT%
+set /a ZERO_LOSS_RATE=%ZERO_LOSS_COUNT%*100/%CHECK_COUNT%
+
+echo.
+echo ================================================================================
+echo MONITORING COMPLETE - DETAILED STATISTICS
+echo ================================================================================
+echo Total checks: %CHECK_COUNT%
+echo.
+echo STATUS BREAKDOWN:
+echo - Perfect (0%% loss): %ZERO_LOSS_COUNT% checks (%ZERO_LOSS_RATE%%%)
+echo - Warning (packet loss): %WARNING_COUNT% checks (%WARNING_RATE%%%)
+echo - Failed (no response): %FAIL_COUNT% checks (%FAIL_RATE%%%)
+echo.
+echo LOSS STATISTICS:
+echo - Average packet loss: %AVG_LOSS%%%
+echo - Network uptime: %SUCCESS_RATE%%%
+echo.
+echo NETWORK QUALITY:
+if %ZERO_LOSS_RATE% GEQ 95 (
+    echo - EXCELLENT: Network is very stable
+) else if %ZERO_LOSS_RATE% GEQ 90 (
+    echo - GOOD: Network is stable
+) else if %ZERO_LOSS_RATE% GEQ 80 (
+    echo - FAIR: Some packet loss detected
+) else (
+    echo - POOR: Significant network issues
+)
+echo.
+echo Report saved: %REPORT%
+echo ================================================================================
+
+echo ======================================== >> "%REPORT%"
+echo MONITORING COMPLETE >> "%REPORT%"
+echo Complete time: %date% %time% >> "%REPORT%"
+echo. >> "%REPORT%"
+echo SUMMARY STATISTICS: >> "%REPORT%"
+echo Total checks: %CHECK_COUNT% >> "%REPORT%"
+echo Perfect checks (0%% loss): %ZERO_LOSS_COUNT% (%ZERO_LOSS_RATE%%%) >> "%REPORT%"
+echo Warning checks (packet loss): %WARNING_COUNT% (%WARNING_RATE%%%) >> "%REPORT%"
+echo Failed checks (no response): %FAIL_COUNT% (%FAIL_RATE%%%) >> "%REPORT%"
+echo. >> "%REPORT%"
+echo NETWORK ANALYSIS: >> "%REPORT%"
+echo Average packet loss: %AVG_LOSS%%% >> "%REPORT%"
+echo Network uptime: %SUCCESS_RATE%%% >> "%REPORT%"
+if %ZERO_LOSS_RATE% GEQ 95 (
+    echo Quality: EXCELLENT - Very stable network >> "%REPORT%"
+) else if %ZERO_LOSS_RATE% GEQ 90 (
+    echo Quality: GOOD - Stable network >> "%REPORT%"
+) else if %ZERO_LOSS_RATE% GEQ 80 (
+    echo Quality: FAIR - Some packet loss detected >> "%REPORT%"
+) else (
+    echo Quality: POOR - Significant network issues >> "%REPORT%"
+)
+echo ======================================== >> "%REPORT%"
+
+:END
+echo.
+set /p OPEN=Open report? (y/n): 
+if /i "%OPEN%"=="y" start notepad "%REPORT%"
+
+echo.
+echo Press any key to exit...
+pause >nul
+
+
+:UPDATE_STATS
+if %CHECK_COUNT% EQU 0 goto :eof
+set /a CURRENT_AVG_LOSS=%TOTAL_LOSS%/%CHECK_COUNT%
+set /a CURRENT_SUCCESS_RATE=%SUCCESS_COUNT%*100/%CHECK_COUNT%
+set /a CURRENT_ZERO_LOSS_RATE=%ZERO_LOSS_COUNT%*100/%CHECK_COUNT%
+
+
+findstr /v "CURRENT STATS" "%REPORT%" > temp_report.txt
+move temp_report.txt "%REPORT%" >nul 2>nul
+
+echo. >> "%REPORT%"
+echo CURRENT STATS: >> "%REPORT%"
+echo Checks so far: %CHECK_COUNT% >> "%REPORT%"
+echo Perfect checks: %ZERO_LOSS_COUNT% (%CURRENT_ZERO_LOSS_RATE%%%) >> "%REPORT%"
+echo Average loss: %CURRENT_AVG_LOSS%%% >> "%REPORT%"
+echo Success rate: %CURRENT_SUCCESS_RATE%%% >> "%REPORT%"
+goto :eof
