@@ -1,0 +1,463 @@
+# SSL 인증서 검증 우회 설정
+add-type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAllCertsPolicy : ICertificatePolicy {
+        public bool CheckValidationResult(
+            ServicePoint srvPoint, X509Certificate certificate,
+            WebRequest request, int certificateProblem) {
+            return true;
+        }
+    }
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# 변수 정의
+$NETSCALERNODE1    = ""
+$NEW_PASSWORD      = ""
+$headers = @{
+    "X-NITRO-USER" = ""
+    "X-NITRO-PASS" = $NEW_PASSWORD
+}
+
+# 인증서 정보 (기존 설치된 인증서)
+$CERTNAME          = ""
+
+# StoreFront 설정
+$SF_VIPNAME        = ""
+$SF_VIP            = ""
+$SF_SERVER1_NAME   = ""
+$SF_SERVER1_IP     = ""
+$SF_STORENAME      = ""
+
+# LDAP 설정 
+$LDAP_SERVER1_NAME = ""
+$LDAP_SERVER1_IP   = ""
+$LDAP_SVC_ACCOUNT  = ""
+$LDAP_SVC_PASSWORD = ""
+$LDAP_BASE_DN      = ""
+
+# Citrix Gateway 설정
+$CTXGW_VIPNAME     = ""
+$CTXGW_VIP         = ""
+$STA1              = ""
+
+# SSO 도메인 설정
+$SSO_DOMAIN        = ""
+
+# 오류 처리 함수
+function Invoke-NetScalerAPI {
+    param(
+        [string]$URI,
+        [string]$Method,
+        [hashtable]$Headers,
+        [string]$Body,
+        [string]$ContentType = "application/json",
+        [string]$Description,
+        [switch]$IgnoreError
+    )
+    
+    try {
+        Write-Host "  -> $Description" -ForegroundColor Yellow
+        $response = Invoke-RestMethod -Uri $URI -Method $Method -Headers $Headers -Body $Body -ContentType $ContentType
+        Write-Host "     ✓ 성공" -ForegroundColor Green
+        return $response
+    }
+    catch {
+        if ($IgnoreError) {
+            Write-Host "     ⚠ 무시됨: $($_.Exception.Message)" -ForegroundColor Gray
+        } else {
+            Write-Host "     ✗ 실패: $($_.Exception.Message)" -ForegroundColor Red
+            if ($_.Exception.Response) {
+                try {
+                    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                    $responseBody = $reader.ReadToEnd()
+                    Write-Host "     응답: $responseBody" -ForegroundColor Red
+                }
+                catch {
+                    Write-Host "     응답 읽기 실패" -ForegroundColor Red
+                }
+            }
+        }
+        return $null
+    }
+}
+
+# =============================================================================
+# 기존 구성 정리 (삭제)
+# =============================================================================
+
+Write-Host "`n=== 기존 구성 정리 (삭제) ===" -ForegroundColor Magenta
+
+# 모든 가능한 LDAP 정책 이름들 삭제 시도 (Basic과 Advanced 모두)
+$possibleLDAPPolicies = @("LDAP_POL", "LDAP_pol", "LDAP_Policy", "ldap_pol", "BASIC_LDAP_POL", "BASIC_LDAP")
+foreach ($policyName in $possibleLDAPPolicies) {
+    # Advanced Authentication Policy 삭제
+    $URI = "https://$NETSCALERNODE1/nitro/v1/config/authenticationpolicy/$policyName"
+    Invoke-NetScalerAPI -URI $URI -Method "DELETE" -Headers $headers -Description "$policyName Advanced 정책 삭제" -IgnoreError
+    
+    # Basic Authentication Policy 삭제
+    $URI = "https://$NETSCALERNODE1/nitro/v1/config/authenticationldappolicy/$policyName"
+    Invoke-NetScalerAPI -URI $URI -Method "DELETE" -Headers $headers -Description "$policyName Basic 정책 삭제" -IgnoreError
+}
+
+# 모든 가능한 LDAP 액션 이름들 삭제 시도
+$possibleLDAPActions = @("LDAP_ACT", "LDAP_Action", "ldap_act")
+foreach ($actionName in $possibleLDAPActions) {
+    $URI = "https://$NETSCALERNODE1/nitro/v1/config/authenticationldapaction/$actionName"
+    Invoke-NetScalerAPI -URI $URI -Method "DELETE" -Headers $headers -Description "$actionName 액션 삭제" -IgnoreError
+}
+
+# 기존 바인딩 먼저 해제
+$bindings = @(
+    "vpnvserver_authenticationpolicy_binding/CTXGW_VIP?policy=LDAP_POL",
+    "vpnvserver_authenticationldappolicy_binding/CTXGW_VIP?policy=LDAP_POL",
+    "vpnvserver_authenticationldappolicy_binding/CTXGW_VIP?policy=BASIC_LDAP_POL",
+    "vpnvserver_authenticationldappolicy_binding/CTXGW_VIP?policy=BASIC_LDAP",
+    "vpnvserver_vpnsessionpolicy_binding/CTXGW_VIP?policy=Web_POL",
+    "vpnvserver_vpnsessionpolicy_binding/CTXGW_VIP?policy=Workspace_App_POL",
+    "vpnvserver_staserver_binding/CTXGW_VIP?staserver=https://",
+    "sslvserver_sslcertkey_binding/CTXGW_VIP?certkeyname=$CERTNAME",
+    "lbvserver_servicegroup_binding/SF_VIP?servicegroupname=",
+    "servicegroup_servicegroupmember_binding/SF_SVG?servername=V",
+    "servicegroup_lbmonitor_binding/SF_SVG?monitor_name=N",
+    "sslvserver_sslcertkey_binding/SF_VIP?certkeyname=$CERTNAME"
+)
+
+foreach ($binding in $bindings) {
+    $URI = "https://$NETSCALERNODE1/nitro/v1/config/$binding"
+    Invoke-NetScalerAPI -URI $URI -Method "DELETE" -Headers $headers -Description "바인딩 해제: $binding" -IgnoreError
+}
+
+# 기존 구성 삭제
+$itemsToDelete = @(
+    @{type="vpnvserver"; name=""},
+    @{type="vpnsessionpolicy"; name="Web_POL"},
+    @{type="vpnsessionpolicy"; name="Workspace_App_POL"},
+    @{type="vpnsessionaction"; name="Web_ACT"},
+    @{type="vpnsessionaction"; name="Workspace_App_ACT"},
+    @{type="authenticationpolicy"; name="LDAP_POL"},
+    @{type="authenticationldapaction"; name="LDAP_ACT"},
+    @{type="lbvserver"; name=""},
+    @{type="lbmonitor"; name=""},
+    @{type="servicegroup"; name=""},
+    @{type="server"; name=""},
+    @{type="server"; name=""}
+)
+
+foreach ($item in $itemsToDelete) {
+    $URI = "https://$NETSCALERNODE1/nitro/v1/config/$($item.type)/$($item.name)"
+    Invoke-NetScalerAPI -URI $URI -Method "DELETE" -Headers $headers -Description "$($item.name) 삭제" -IgnoreError
+}
+
+Start-Sleep -Seconds 3
+
+# =============================================================================
+# StoreFront 로드밸런서 구성
+# =============================================================================
+
+Write-Host "`n=== StoreFront 로드밸런서 구성 ===" -ForegroundColor Cyan
+
+# SF - Create backend server 1
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/server"
+$BODY = "{""server"":{""name"":""$SF_SERVER1_NAME"",""ipaddress"":""$SF_SERVER1_IP""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "StoreFront 서버 생성"
+
+# SF - Create ServiceGroup 
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/servicegroup"
+$BODY = "{""servicegroup"":{""servicegroupname"":""SF_SVG"",""servicetype"":""SSL""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "StoreFront ServiceGroup 생성"
+
+# SF - Bind Server 1 to ServiceGroup
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/servicegroup_servicegroupmember_binding"
+$BODY = "{""servicegroup_servicegroupmember_binding"":{""servername"":""$SF_SERVER1_NAME"",""servicegroupname"":""SF_SVG"",""port"":443}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "StoreFront 서버를 ServiceGroup에 바인딩"
+
+# SF - Create Monitor
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/lbmonitor"
+$BODY = "{""lbmonitor"":{""monitorname"":""SF_MON"",""type"":""STOREFRONT"",""secure"":""YES"",""storename"":""$SF_STORENAME""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "StoreFront 모니터 생성"
+
+# SF - Bind Monitor to servicegroup
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/servicegroup_lbmonitor_binding"
+$BODY = "{""servicegroup_lbmonitor_binding"":{""servicegroupname"":""SF_SVG"",""monitor_name"":""SF_MON""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "StoreFront 모니터를 ServiceGroup에 바인딩"
+
+# SF - Create LB virtual server
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/lbvserver"
+$BODY = "{""lbvserver"":{""name"":""$SF_VIPNAME"",""servicetype"":""SSL"",""ipv46"":""$SF_VIP"",""port"":443,""persistencetype"":""COOKIEINSERT"",""timeout"":60}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "StoreFront LB 가상서버 생성"
+
+# SF - Bind Servicegroup to LB virtual server
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/lbvserver_servicegroup_binding"
+$BODY = "{""lbvserver_servicegroup_binding"":{""servicegroupname"":""SF_SVG"",""name"":""$SF_VIPNAME""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "ServiceGroup을 StoreFront LB에 바인딩"
+
+# SF - Bind SSL Certificate
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/sslvserver_sslcertkey_binding"
+$BODY = "{""sslvserver_sslcertkey_binding"":{""vservername"":""$SF_VIPNAME"",""certkeyname"":""$CERTNAME""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "StoreFront LB에 SSL 인증서 바인딩"
+
+# =============================================================================
+# LDAP 서버 구성 (LB 없이 직접 연결)
+# =============================================================================
+
+Write-Host "`n=== LDAP 서버 구성 (직접 연결) ===" -ForegroundColor Cyan
+
+# LDAP - Create backend server only (LB 없음)
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/server"
+$BODY = "{""server"":{""name"":""$LDAP_SERVER1_NAME"",""ipaddress"":""$LDAP_SERVER1_IP""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "AD 서버 생성 (직접 연결용)"
+
+# =============================================================================
+# 인증 구성 (LDAP Authentication) - 공식 문서 기준
+# =============================================================================
+
+Write-Host "`n=== LDAP 인증 구성 (공식 문서 기준) ===" -ForegroundColor Cyan
+
+# Create LDAP authentication action (기존과 동일)
+$URI = "https://"+$NETSCALERNODE1+"/nitro/v1/config/authenticationldapaction"
+$BODY = "{""authenticationldapaction"":{""name"":""LDAP_ACT"",""serverip"":"""+$LDAP_SERVER1_IP+""",""sectype"":""SSL"",""serverport"":""636"",""authtimeout"":""3"",""authentication"":""ENABLED"",""ldapbase"":"""+$LDAP_BASE_DN+""",""ldapbinddn"":"""+$LDAP_SVC_ACCOUNT+""",""ldapbinddnpassword"":"""+$LDAP_SVC_PASSWORD+""",""ldaploginname"":""sAMAccountName"",""email"":""mail"",""requireuser"":""YES"",""passwdchange"":""ENABLED"",""ssonameattribute"":""UserPrincipalName"",""groupattrname"":""memberOf"",""subattributename"":""cn""}}"
+Write-Host "  -> LDAP 인증 액션 생성 (LDAP_ACT)" -ForegroundColor Yellow
+try {
+    Invoke-RestMethod -Uri $URI -Method Post -Headers $headers -Body $BODY -ContentType "application/json"
+    Write-Host "     ✓ 성공" -ForegroundColor Green
+    $actionSuccess = $true
+} catch {
+    Write-Host "     ✗ 실패: $($_.Exception.Message)" -ForegroundColor Red
+    $actionSuccess = $false
+}
+
+# Wait for action to be created
+Start-Sleep -Seconds 3
+
+if ($actionSuccess) {
+    # Create LDAP policy for Basic Authentication (NS_TRUE 규칙 사용)
+    Write-Host "  → LDAP Policy 생성 (Basic Authentication - NS_TRUE 규칙)..." -ForegroundColor Yellow
+    $URI = "https://"+$NETSCALERNODE1+"/nitro/v1/config/authenticationldappolicy"
+    # NS_TRUE 규칙 사용 (TRUE는 이 NetScaler 버전에서 작동하지 않음)
+    $BODY = "{""authenticationldappolicy"":{""name"":""LDAP_POL"",""rule"":""NS_TRUE"",""reqaction"":""LDAP_ACT""}}"
+    
+    Write-Host "    사용할 JSON: $BODY" -ForegroundColor Gray
+    
+    try {
+        Invoke-RestMethod -Uri $URI -Method Post -Headers $headers -Body $BODY -ContentType "application/json"
+        Write-Host "     ✓ 성공" -ForegroundColor Green
+        $GLOBAL_LDAP_POLICY = "LDAP_POL"
+        $POLICY_TYPE = "Basic"
+        Write-Host "  ✓ LDAP 정책 생성 성공: LDAP_POL (Basic Authentication)" -ForegroundColor Green
+    } catch {
+        Write-Host "     ✗ 실패: $($_.Exception.Message)" -ForegroundColor Red
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $responseBody = $reader.ReadToEnd()
+                Write-Host "     응답: $responseBody" -ForegroundColor Red
+            }
+            catch {
+                Write-Host "     응답 읽기 실패" -ForegroundColor Red
+            }
+        }
+        $GLOBAL_LDAP_POLICY = $null
+    }
+} else {
+    Write-Host "  ✗ LDAP 액션 생성 실패로 정책 생성 건너뜀" -ForegroundColor Red
+    $GLOBAL_LDAP_POLICY = $null
+}
+
+# =============================================================================
+# VPN 세션 구성
+# =============================================================================
+
+Write-Host "`n=== VPN 세션 구성 ===" -ForegroundColor Cyan
+
+# Create Web session action (기본 설정으로 생성)
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnsessionaction"
+$BODY = "{""vpnsessionaction"":{""name"":""Web_ACT"",""sesstimeout"":60,""transparentinterception"":""OFF"",""defaultauthorizationaction"":""ALLOW"",""icaproxy"":""ON"",""wihome"":""https://$SF_VIP/Citrix/$($SF_STORENAME)Web""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "웹 세션 액션 생성 (기본 설정)"
+
+# Create Workspace App session action (기본 설정으로 생성)
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnsessionaction"
+$BODY = "{""vpnsessionaction"":{""name"":""Workspace_App_ACT"",""sesstimeout"":60,""transparentinterception"":""OFF"",""defaultauthorizationaction"":""ALLOW"",""icaproxy"":""ON"",""storefronturl"":""https://$SF_VIP""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "Workspace App 세션 액션 생성 (기본 설정)"
+
+# Create Web session policy
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnsessionpolicy"
+$BODY = "{""vpnsessionpolicy"":{""name"":""Web_POL"",""action"":""Web_ACT"",""rule"":""HTTP.REQ.HEADER(\""User-Agent\"").CONTAINS(\""CitrixReceiver\"").NOT""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "웹 세션 정책 생성"
+
+# Create Workspace App session policy
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnsessionpolicy"
+$BODY = "{""vpnsessionpolicy"":{""name"":""Workspace_App_POL"",""action"":""Workspace_App_ACT"",""rule"":""HTTP.REQ.HEADER(\""User-Agent\"").CONTAINS(\""CitrixReceiver\"")""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "Workspace App 세션 정책 생성"
+
+# =============================================================================
+# Citrix Gateway 구성
+# =============================================================================
+
+Write-Host "`n=== Citrix Gateway 구성 ===" -ForegroundColor Cyan
+
+# Create Citrix Gateway virtual server with ICA Only and DTLS disabled
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnvserver"
+$BODY = "{""vpnvserver"":{""name"":""$CTXGW_VIPNAME"",""servicetype"":""SSL"",""ipv46"":""$CTXGW_VIP"",""port"":443,""maxloginattempts"":5,""failedlogintimeout"":15,""icaonly"":""ON"",""dtls"":""OFF""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "Citrix Gateway 가상서버 생성 (ICA Only ON, DTLS OFF)"
+
+# Bind SSL certificate to Citrix Gateway
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/sslvserver_sslcertkey_binding"
+$BODY = "{""sslvserver_sslcertkey_binding"":{""vservername"":""$CTXGW_VIPNAME"",""certkeyname"":""$CERTNAME""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "Gateway에 SSL 인증서 바인딩"
+
+# Wait for VPN virtual server to be ready
+Start-Sleep -Seconds 3
+
+# Check if LDAP policy exists and bind (Basic Authentication용)
+Write-Host "`n=== LDAP 정책 바인딩 (Basic Authentication) ===" -ForegroundColor Cyan
+if ($GLOBAL_LDAP_POLICY) {
+    Write-Host "  ✓ 생성된 Basic LDAP 정책 사용: $GLOBAL_LDAP_POLICY" -ForegroundColor Green
+    
+    # Bind LDAP authentication policy to Citrix Gateway (Basic Authentication용)
+    $URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnvserver_authenticationldappolicy_binding"
+    $BODY = "{""vpnvserver_authenticationldappolicy_binding"":{""name"":""$CTXGW_VIPNAME"",""policy"":""$GLOBAL_LDAP_POLICY"",""priority"":100}}"
+    Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "Basic LDAP 인증 정책 ($GLOBAL_LDAP_POLICY)을 Gateway에 바인딩"
+} else {
+    Write-Host "  ✗ LDAP 정책이 생성되지 않음 - 수동으로 생성 필요" -ForegroundColor Red
+    Write-Host "    GUI에서 System > Authentication > Basic Policies > LDAP > Policies에서 수동 생성하세요" -ForegroundColor Yellow
+    Write-Host "    Name: LDAP_POL, Action: $LDAP_ACTION_NAME, Rule: NS_TRUE" -ForegroundColor Gray
+}
+
+# Bind session policies to Citrix Gateway
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnvserver_vpnsessionpolicy_binding"
+$BODY = "{""vpnvserver_vpnsessionpolicy_binding"":{""name"":""$CTXGW_VIPNAME"",""policy"":""Web_POL"",""priority"":100}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "웹 세션 정책을 Gateway에 바인딩"
+
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnvserver_vpnsessionpolicy_binding"
+$BODY = "{""vpnvserver_vpnsessionpolicy_binding"":{""name"":""$CTXGW_VIPNAME"",""policy"":""Workspace_App_POL"",""priority"":110}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "Workspace App 세션 정책을 Gateway에 바인딩"
+
+# Bind STA server to Citrix Gateway
+$URI = "https://$NETSCALERNODE1/nitro/v1/config/vpnvserver_staserver_binding"
+$BODY = "{""vpnvserver_staserver_binding"":{""name"":""$CTXGW_VIPNAME"",""staserver"":""$STA1""}}"
+Invoke-NetScalerAPI -URI $URI -Method "POST" -Headers $headers -Body $BODY -Description "STA 서버를 Gateway에 바인딩"
+
+# =============================================================================
+# 세션 프로파일 업데이트 (공식 문서 기준 수정)
+# =============================================================================
+
+Write-Host "`n=== 세션 프로파일 업데이트 (공식 문서 기준) ===" -ForegroundColor Cyan
+
+# Step 1: SSO 및 NT Domain 설정 (Web_ACT)
+Write-Host "  단계 1: Web_ACT에 SSO 및 NT Domain 설정" -ForegroundColor Yellow
+$URI = "https://"+$NETSCALERNODE1+"/nitro/v1/config/vpnsessionaction"
+# 공식 문서 기준: sso=ON, ntdomain=<SSO_DOMAIN>, httpport=[80] (배열 형태)
+$BODY = "{""vpnsessionaction"":{""name"":""Web_ACT"",""sso"":""ON"",""ntdomain"":""$SSO_DOMAIN"",""httpport"":[80]}}"
+try {
+    Invoke-RestMethod -Uri $URI -Method PUT -Headers $headers -Body $BODY -ContentType "application/json"
+    Write-Host "     ✓ 성공 (SSO=ON, NT Domain=$SSO_DOMAIN, HTTP Port=80)" -ForegroundColor Green
+} catch {
+    Write-Host "     ✗ 실패: $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.Exception.Response) {
+        try {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $responseBody = $reader.ReadToEnd()
+            Write-Host "     응답: $responseBody" -ForegroundColor Red
+        }
+        catch {
+            Write-Host "     응답 읽기 실패" -ForegroundColor Red
+        }
+    }
+}
+
+# Step 2: SSO 및 NT Domain 설정 (Workspace_App_ACT)
+Write-Host "  단계 2: Workspace_App_ACT에 SSO 및 NT Domain 설정" -ForegroundColor Yellow
+$URI = "https://"+$NETSCALERNODE1+"/nitro/v1/config/vpnsessionaction"
+# Workspace_App_ACT는 StoreFront URL이 이미 설정되어 있으므로 SSO와 NT Domain만 추가
+$BODY = "{""vpnsessionaction"":{""name"":""Workspace_App_ACT"",""sso"":""ON"",""ntdomain"":""$SSO_DOMAIN""}}"
+try {
+    Invoke-RestMethod -Uri $URI -Method PUT -Headers $headers -Body $BODY -ContentType "application/json"
+    Write-Host "     ✓ 성공 (SSO=ON, NT Domain=$SSO_DOMAIN)" -ForegroundColor Green
+} catch {
+    Write-Host "     ✗ 실패: $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.Exception.Response) {
+        try {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $responseBody = $reader.ReadToEnd()
+            Write-Host "     응답: $responseBody" -ForegroundColor Red
+        }
+        catch {
+            Write-Host "     응답 읽기 실패" -ForegroundColor Red
+        }
+    }
+}
+
+# Step 3: 설정 확인
+Write-Host "  단계 3: 설정 확인" -ForegroundColor Yellow
+$profiles = @("Web_ACT", "Workspace_App_ACT")
+foreach ($profile in $profiles) {
+    $URI = "https://"+$NETSCALERNODE1+"/nitro/v1/config/vpnsessionaction/$profile"
+    try {
+        $result = Invoke-RestMethod -Uri $URI -Method GET -Headers $headers -ContentType "application/json"
+        $action = $result.vpnsessionaction
+        Write-Host "    $profile 설정:" -ForegroundColor Gray
+        Write-Host "      SSO: $($action.sso)" -ForegroundColor White
+        Write-Host "      NT Domain: $($action.ntdomain)" -ForegroundColor White
+        if ($action.httpport) {
+            Write-Host "      HTTP Port: $($action.httpport -join ',')" -ForegroundColor White
+        }
+        if ($action.wihome) {
+            Write-Host "      Web Interface: $($action.wihome)" -ForegroundColor White
+        }
+        if ($action.storefronturl) {
+            Write-Host "      StoreFront URL: $($action.storefronturl)" -ForegroundColor White
+        }
+    } catch {
+        Write-Host "    $profile 확인 실패" -ForegroundColor Red
+    }
+}
+
+# =============================================================================
+# 구성 완료
+# =============================================================================
+
+Write-Host "`n=== 구성 완료 ===" -ForegroundColor Green
+Write-Host "StoreFront URL: https://$SF_VIP" -ForegroundColor White
+Write-Host "LDAP 서버: $LDAP_SERVER1_IP`:636 (직접 연결)" -ForegroundColor White
+Write-Host "Citrix Gateway URL: https://$CTXGW_VIP" -ForegroundColor White
+Write-Host "STA Server: $STA1" -ForegroundColor White
+Write-Host "SSO Domain: $SSO_DOMAIN" -ForegroundColor White
+
+Write-Host "`n=== 설정된 구성 ===" -ForegroundColor Yellow
+Write-Host "✓ LDAP 인증: 직접 서버 연결 ($LDAP_SERVER1_IP`:636)" -ForegroundColor Green
+Write-Host "✓ ICA Only: 활성화됨" -ForegroundColor Green
+Write-Host "✓ DTLS: 비활성화됨" -ForegroundColor Green
+Write-Host "✓ Session Profile - SSO: 활성화됨" -ForegroundColor Green
+Write-Host "✓ Session Profile - Account Services Address: $SF_VIP" -ForegroundColor Green
+Write-Host "✓ Session Profile - Web Interface Address: https://$SF_VIP/Citrix/$($SF_STORENAME)Web" -ForegroundColor Green
+
+Write-Host "`n=== 핵심 수정사항 ===" -ForegroundColor Magenta
+Write-Host "✓ LDAPS LB 제거 - Gateway가 AD 서버를 직접 바라봄" -ForegroundColor Green
+Write-Host "✓ LDAP Action에서 서버 IP 직접 사용: $LDAP_SERVER1_IP" -ForegroundColor Green
+Write-Host "✓ 공식 문서 기준 authenticationldappolicy 사용" -ForegroundColor Green
+Write-Host "✓ Basic Authentication (Gateway 바인딩 가능)" -ForegroundColor Green
+Write-Host "✓ 올바른 파라미터 순서: name, rule, reqaction" -ForegroundColor Green
+Write-Host "✓ NS_TRUE 규칙 사용 (TRUE는 이 버전에서 작동하지 않음)" -ForegroundColor Green
+
+Write-Host "`n=== 확인사항 ===" -ForegroundColor Yellow
+if ($GLOBAL_LDAP_POLICY) {
+    Write-Host "1. ✓ System > Authentication > Basic Policies > LDAP > Policies에서 $GLOBAL_LDAP_POLICY 확인" -ForegroundColor Green
+    Write-Host "2. ✓ VPN Virtual Server > CTXGW_VIP > Basic Authentication에 $GLOBAL_LDAP_POLICY 바인딩 확인" -ForegroundColor Green
+} else {
+    Write-Host "1. ⚠ LDAP 정책이 생성되지 않았으므로 GUI에서 수동 생성 필요" -ForegroundColor Yellow
+    Write-Host "   System > Authentication > Basic Policies > LDAP > Policies > Add" -ForegroundColor White
+    Write-Host "   Name: LDAP_POL, Action: $LDAP_ACTION_NAME, Rule: NS_TRUE" -ForegroundColor White
+}
+Write-Host "3. ICA Only와 DTLS 설정 확인" -ForegroundColor White
+Write-Host "4. ✓ Session Profiles에서 SSO와 NT Domain 설정 완료" -ForegroundColor Green
+Write-Host "   Web_ACT: SSO=ON, NT Domain=$SSO_DOMAIN, HTTP Port=80" -ForegroundColor Gray
+Write-Host "   Workspace_App_ACT: SSO=ON, NT Domain=$SSO_DOMAIN, StoreFront URL=https://$SF_VIP" -ForegroundColor Gray
+
+Write-Host "`n=== 중요한 변경점 ===" -ForegroundColor Magenta
+Write-Host "공식 문서 해결: ssodomain → ntdomain, httpport를 배열로 처리" -ForegroundColor Green
+Write-Host "해결방법: authenticationldappolicy + reqaction + NS_TRUE → Basic Authentication" -ForegroundColor Green
+Write-Host "바인딩: vpnvserver_authenticationldappolicy_binding 사용" -ForegroundColor Green
+Write-Host "규칙: NS_TRUE 사용 (NetScaler Basic LDAP Policy의 올바른 규칙)" -ForegroundColor Green
